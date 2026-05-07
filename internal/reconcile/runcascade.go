@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 
 	"github.com/rancher/release-automation/internal/cascade"
@@ -87,46 +85,9 @@ func (r *Reconciler) RunCascade(ctx context.Context, leafBranch string, independ
 		pairedTables[name] = tbl
 	}
 
-	resolver := func(name, branch string) (string, error) {
-		return r.resolveLatestForBranch(ctx, name, branch)
-	}
-
-	sources, stages, err := cascade.ComputeStages(r.cfg, independents, leafRepo, leafBranch, leafTable, pairedTables, resolver, nil)
+	sources, stages, err := cascade.PlanStages(ctx, r.cfg, independents, leafRepo, leafBranch, leafTable, pairedTables, r.cascadePlanner())
 	if err != nil {
-		return fmt.Errorf("compute cascade stages: %w", err)
-	}
-
-	// Decide which paired-latest sources need their own bump→tag stage instead
-	// of being consumed at their current tag. Two reasons trigger promotion:
-	//
-	//   - branch-ahead / pin-drift (detectStalePairedRepos): the dep has
-	//     unreleased commits or pins a stale upstream — the next release has
-	//     to come from HEAD.
-	//   - unRC (forceUnRCPromotions): the dep's strategy is unrc and its
-	//     latest tag is still an rc — the operator wants the same commit
-	//     re-tagged as GA, which the staleness check would never flag (no
-	//     branch-ahead, no pin-drift) but is the whole point of the unrc
-	//     workflow.
-	//
-	// Both flavors merge into one promote set; ComputeStages re-runs once
-	// with the union.
-	leafMinor := leafTable.LookupMinor(leafBranch)
-	promote, err := r.detectStalePairedRepos(ctx, sources, leafMinor, pairedTables)
-	if err != nil {
-		log.Printf("cascade: stale detection error (continuing): %v", err)
-	}
-	if promote == nil {
-		promote = map[string]bool{}
-	}
-	for name := range r.forceUnRCPromotions(sources) {
-		promote[name] = true
-	}
-	if len(promote) > 0 {
-		log.Printf("cascade: promoting paired repos into propagation: %v", sortedKeys(promote))
-		sources, stages, err = cascade.ComputeStages(r.cfg, independents, leafRepo, leafBranch, leafTable, pairedTables, resolver, promote)
-		if err != nil {
-			return fmt.Errorf("compute cascade stages (with promoted repos): %w", err)
-		}
+		return err
 	}
 
 	if err := r.fillTagPromptHints(ctx, stages, leafTable, pairedTables); err != nil {
@@ -338,57 +299,25 @@ func (r *Reconciler) assertReleaseExists(ctx context.Context, depRepo config.Rep
 	return fmt.Errorf("dep %s has no published release %s on %s", dep, version, ghRepo)
 }
 
-// resolveLatestForBranch returns the highest existing release tag on
-// `repoName`'s `branch` (matched by VERSION.md minor). Used by ComputeStages
-// to pin paired-latest sources at cascade creation. "" with no error means
-// the branch has no published release yet.
-func (r *Reconciler) resolveLatestForBranch(ctx context.Context, repoName, branch string) (string, error) {
-	repoCfg, ok := r.cfg.Repos[repoName]
+// cascadePlanner returns a cascade.RepoFactory that hands out per-repo
+// RepoView adapters wrapping the reconciler's GH client and version-table
+// cache. PlanStages calls Repo for each repo it needs to query.
+func (r *Reconciler) cascadePlanner() cascade.RepoFactory {
+	return &reconcilePlanner{r: r}
+}
+
+type reconcilePlanner struct{ r *Reconciler }
+
+func (p *reconcilePlanner) Repo(name string) (cascade.RepoView, error) {
+	repoCfg, ok := p.r.cfg.Repos[name]
 	if !ok {
-		return "", fmt.Errorf("repo %q not in config", repoName)
+		return nil, fmt.Errorf("repo %q not in config", name)
 	}
 	ghRepo, err := repoCfg.GitHubRepo()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var minor string
-	if repoCfg.BranchTemplate != "" {
-		// Branch-template repos (rancher/charts) carry the rancher minor in
-		// the branch name itself, so VERSION.md isn't required — and isn't
-		// available (rancher/charts has no VERSION.md). Extract by reversing
-		// the template substitution.
-		before, after, ok := strings.Cut(repoCfg.BranchTemplate, "{rancher-minor}")
-		if !ok {
-			return "", fmt.Errorf("repo %q: branch-template %q lacks {rancher-minor} placeholder", repoName, repoCfg.BranchTemplate)
-		}
-		if !strings.HasPrefix(branch, before) || !strings.HasSuffix(branch, after) {
-			return "", fmt.Errorf("repo %q: branch %q does not match template %q", repoName, branch, repoCfg.BranchTemplate)
-		}
-		minor = strings.TrimSuffix(strings.TrimPrefix(branch, before), after)
-	} else {
-		tbl, err := r.fetchVersionTable(ctx, repoName)
-		if err != nil {
-			return "", fmt.Errorf("fetch %s VERSION.md: %w", repoName, err)
-		}
-		minor = tbl.LookupMinor(branch)
-		if minor == "" {
-			return "", fmt.Errorf("branch %q not in %s VERSION.md", branch, repoName)
-		}
-	}
-	tags, err := r.gh.ListReleaseTags(ctx, ghRepo)
-	if err != nil {
-		return "", err
-	}
-	var best string
-	for _, t := range tags {
-		if !semver.IsValid(t) || semver.MajorMinor(t) != minor {
-			continue
-		}
-		if best == "" || semver.Compare(t, best) > 0 {
-			best = t
-		}
-	}
-	return best, nil
+	return &reconcileRepoView{r: p.r, repoKey: name, ghRepo: ghRepo}, nil
 }
 
 // fillTagPromptHints populates each TagPrompt's Expected (next-patch
@@ -466,211 +395,6 @@ func (r *Reconciler) predictNextTag(ctx context.Context, ghRepo, minor string, s
 	default:
 		return cascade.PredictNextPatch(tags, minor), nil
 	}
-}
-
-// forceUnRCPromotions returns the paired-latest sources that need a bump→tag
-// stage purely because their strategy is unrc. Unlike detectStalePairedRepos,
-// no branch-ahead or pin-drift signal is consulted — the unrc workflow is
-// "tag this rc'd commit as GA", and the same commit already carrying an rc
-// tag is precisely what makes the re-tag necessary, not a reason to skip it.
-//
-// Promotion is gated on the pinned version actually carrying an -rc.N
-// suffix: when the latest tag is already a GA, there is nothing to unRC and
-// the cascade falls back to propagating the existing GA as paired-latest.
-func (r *Reconciler) forceUnRCPromotions(sources []cascade.Source) map[string]bool {
-	out := map[string]bool{}
-	for _, src := range sources {
-		if src.Explicit {
-			continue
-		}
-		repo, ok := r.cfg.Repos[src.Name]
-		if !ok {
-			continue
-		}
-		if repo.NextTagStrategy != config.NextTagUnRC {
-			continue
-		}
-		if _, _, hasRC := cascade.SplitRC(src.Version); !hasRC {
-			continue
-		}
-		out[src.Name] = true
-	}
-	return out
-}
-
-// detectStalePairedRepos scans paired-latest sources (and their managed paired
-// deps transitively) for two flavors of staleness, both of which require
-// promoting the affected repo into the cascade's propagation set so it gets a
-// proper bump→tag stage:
-//
-//  1. Branch-ahead: the repo's branch HEAD has unreleased commits past its
-//     latest tag. The next release will be from HEAD, so a re-cut is needed.
-//  2. Pin-drift: the repo's go.mod (at its latest tag) pins one of its paired
-//     deps at a version BELOW that dep's own latest tag. Without a re-cut,
-//     downstream consumers picking up this repo at paired-latest would inherit
-//     the stale upstream pin.
-//
-// The scan starts from each paired-latest source and follows go.mod deps one
-// level at a time. Independent deps are skipped — their release cycle is
-// separate and managed via explicit-independent cascades.
-func (r *Reconciler) detectStalePairedRepos(
-	ctx context.Context,
-	sources []cascade.Source,
-	leafMinor string,
-	pairedTables map[string]*config.VersionTable,
-) (map[string]bool, error) {
-	moduleToRepo := r.cfg.ModuleToRepo()
-
-	// depLatest caches per-dep latest-tag lookups so multiple parents pinning
-	// the same dep don't trigger duplicate ListReleaseTags calls. An empty
-	// string is a valid cached value (means "no published release on this
-	// branch") and short-circuits the pin-drift comparison.
-	depLatest := map[string]string{}
-	resolveDepLatest := func(depName string) (string, error) {
-		if v, ok := depLatest[depName]; ok {
-			return v, nil
-		}
-		br, err := r.branchForRepo(depName, leafMinor, pairedTables)
-		if err != nil || br == "" {
-			depLatest[depName] = ""
-			return "", err
-		}
-		tag, err := r.resolveLatestForBranch(ctx, depName, br)
-		if err != nil {
-			return "", err
-		}
-		depLatest[depName] = tag
-		return tag, nil
-	}
-
-	stale := map[string]bool{}
-	queue := map[string]bool{}
-	for _, src := range sources {
-		if !src.Explicit {
-			queue[src.Name] = true
-		}
-	}
-
-	checked := map[string]bool{}
-	for len(queue) > 0 {
-		var name string
-		for n := range queue {
-			name = n
-			break
-		}
-		delete(queue, name)
-		if checked[name] {
-			continue
-		}
-		checked[name] = true
-
-		repoCfg, ok := r.cfg.Repos[name]
-		if !ok {
-			continue
-		}
-		ghRepo, err := repoCfg.GitHubRepo()
-		if err != nil {
-			continue
-		}
-		branch, err := r.branchForRepo(name, leafMinor, pairedTables)
-		if err != nil || branch == "" {
-			log.Printf("cascade stale: %s branch lookup: %v", name, err)
-			continue
-		}
-
-		// Baseline is the dep's own latest release tag — never an upstream's
-		// go.mod pin. The pin lags real releases, so it would false-positive
-		// any dep that has tagged since the upstream's last release.
-		latestTag, err := r.resolveLatestForBranch(ctx, name, branch)
-		if err != nil {
-			log.Printf("cascade stale: %s resolve latest tag on %s: %v", name, branch, err)
-			continue
-		}
-		if latestTag == "" {
-			log.Printf("cascade stale: %s has no released tag on %s — skipping", name, branch)
-			continue
-		}
-		depLatest[name] = latestTag
-
-		ahead, err := r.gh.CommitsAheadOf(ctx, ghRepo, latestTag, branch)
-		if err != nil {
-			log.Printf("cascade stale: %s ahead check: %v", name, err)
-			continue
-		}
-		if ahead > 0 {
-			log.Printf("cascade: %s branch %s is %d commit(s) ahead of %s — promoting into cascade stages", name, branch, ahead, latestTag)
-			stale[name] = true
-		}
-
-		gomod, err := r.gh.FetchFile(ctx, ghRepo, latestTag, "go.mod")
-		if err != nil {
-			log.Printf("cascade stale: fetch %s@%s go.mod: %v", name, latestTag, err)
-			continue
-		}
-		mf, err := modfile.Parse("go.mod", []byte(gomod), nil)
-		if err != nil {
-			continue
-		}
-		for _, req := range mf.Require {
-			depName, ok := moduleToRepo[req.Mod.Path]
-			if !ok {
-				continue
-			}
-			depCfg, ok := r.cfg.Repos[depName]
-			if !ok || depCfg.Kind != config.KindPaired {
-				continue
-			}
-
-			// Pin-drift: the parent's released go.mod pins this dep at a
-			// version below the dep's own latest tag. Without a re-cut, any
-			// downstream picking the parent up at paired-latest inherits the
-			// stale upstream pin. Mark the PARENT (`name`) stale.
-			if pinVer := req.Mod.Version; semver.IsValid(pinVer) {
-				if depTag, err := resolveDepLatest(depName); err != nil {
-					log.Printf("cascade stale: %s pin-drift check for %s: %v", name, depName, err)
-				} else if depTag != "" && semver.Compare(pinVer, depTag) < 0 && !stale[name] {
-					log.Printf("cascade: %s pins %s %s but %s latest tag is %s — promoting %s into cascade stages",
-						name, depName, pinVer, depName, depTag, name)
-					stale[name] = true
-				}
-			}
-
-			if !checked[depName] {
-				queue[depName] = true
-			}
-		}
-	}
-	return stale, nil
-}
-
-// sortedKeys returns the keys of m in sorted order, for deterministic logging.
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// branchForRepo returns the branch of `repoName` that corresponds to
-// `leafMinor`. Handles both VERSION.md paired repos and branch-template repos.
-func (r *Reconciler) branchForRepo(repoName, leafMinor string, pairedTables map[string]*config.VersionTable) (string, error) {
-	repoCfg, ok := r.cfg.Repos[repoName]
-	if !ok {
-		return "", fmt.Errorf("repo %q not in config", repoName)
-	}
-	switch repoCfg.Kind {
-	case config.KindIndependent:
-		return "main", nil
-	case config.KindPaired:
-		br, err := repoCfg.ResolveBranch(leafMinor, pairedTables[repoName])
-		if err != nil {
-			return "", fmt.Errorf("resolve branch for %s: %w", repoName, err)
-		}
-		return br, nil
-	}
-	return "", fmt.Errorf("repo %q: unsupported kind %q", repoName, repoCfg.Kind)
 }
 
 // actorAssignees returns a single-element slice for the given actor, or nil
