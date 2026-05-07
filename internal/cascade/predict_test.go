@@ -1,4 +1,4 @@
-package reconcile
+package cascade
 
 import "testing"
 
@@ -16,7 +16,7 @@ func TestPredictNextPatch(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := predictNextPatch(tt.tags, tt.minor)
+			got := PredictNextPatch(tt.tags, tt.minor)
 			if got != tt.want {
 				t.Errorf("got %q want %q", got, tt.want)
 			}
@@ -41,7 +41,7 @@ func TestPredictNextRC(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := predictNextRC(tt.tags, tt.minor)
+			got := PredictNextRC(tt.tags, tt.minor)
 			if got != tt.want {
 				t.Errorf("got %q want %q", got, tt.want)
 			}
@@ -65,7 +65,7 @@ func TestPredictUnRC(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := predictUnRC(tt.tags, tt.minor)
+			got := PredictUnRC(tt.tags, tt.minor)
 			if got != tt.want {
 				t.Errorf("got %q want %q", got, tt.want)
 			}
@@ -88,7 +88,7 @@ func TestSplitRC(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			base, n, hasRC := splitRC(tt.tag)
+			base, n, hasRC := SplitRC(tt.tag)
 			if base != tt.wantBase || n != tt.wantN || hasRC != tt.wantHasRC {
 				t.Errorf("got (%q, %d, %v) want (%q, %d, %v)", base, n, hasRC, tt.wantBase, tt.wantN, tt.wantHasRC)
 			}

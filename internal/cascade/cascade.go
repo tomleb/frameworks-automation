@@ -81,6 +81,22 @@ type Bump struct {
 	State  string    `yaml:"state,omitempty"` // "" | open | ci-failing | approved | merged | closed
 }
 
+// Ready reports whether every Dep in `b` has a non-empty Version. The
+// cascade only opens a Bump's PR once the whole bundle is resolved, since
+// cascades can't go back and add deps to an existing PR without rebasing
+// it.
+func (b *Bump) Ready() bool {
+	if len(b.Deps) == 0 {
+		return false
+	}
+	for _, d := range b.Deps {
+		if d.Version == "" {
+			return false
+		}
+	}
+	return true
+}
+
 // DepBump is one (dep, module, version) triple inside a Bump's bundle.
 // `Dep` is the config-key name of the dep being bumped (e.g. "wrangler");
 // `Module` is its Go module path; `Version` is the target tag, "" until a

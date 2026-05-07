@@ -209,7 +209,7 @@ func (r *Reconciler) openCascadeStageBumps(ctx context.Context, op *cascade.Op, 
 	mutated := false
 	for i := range op.Stages[stage].Bumps {
 		bp := &op.Stages[stage].Bumps[i]
-		if bp.PR != 0 || !bumpReady(bp) {
+		if bp.PR != 0 || !bp.Ready() {
 			continue
 		}
 		downstream, ok := r.cfg.Repos[bp.Repo]
@@ -244,7 +244,10 @@ func (r *Reconciler) openCascadeStageBumps(ctx context.Context, op *cascade.Op, 
 			// on this minor also has every dep at target, no NEW tag is
 			// needed — claim the existing tag for this stage's prompt and
 			// let the cascade auto-advance.
-			if claimed, err := r.maybeClaimExistingTag(ctx, op, stage, bp); err != nil {
+			repoView, vErr := r.bumpRepoView(bp)
+			if vErr != nil {
+				log.Printf("cascade: existing-tag check %s %s: %v", bp.Repo, bp.Branch, vErr)
+			} else if claimed, err := cascade.MaybeClaimExistingTag(ctx, op, stage, bp, repoView); err != nil {
 				log.Printf("cascade: existing-tag check %s %s: %v", bp.Repo, bp.Branch, err)
 			} else if claimed != "" {
 				log.Printf("cascade: %s %s already at target via existing tag %s", bp.Repo, bp.Branch, claimed)
@@ -259,139 +262,48 @@ func (r *Reconciler) openCascadeStageBumps(ctx context.Context, op *cascade.Op, 
 	return mutated, nil
 }
 
-// maybeClaimExistingTag handles the "branch was already at target before we
-// touched it" case. When the latest published tag on bp's branch lineage has
-// every dep in bp pinned at its target version, that existing tag satisfies
-// the cascade-mid prompt — no new release is required. Sets the matching
-// TagPrompt's Version+Tagged and returns the claimed tag; returns "" when
-// no satisfying tag was found.
-func (r *Reconciler) maybeClaimExistingTag(ctx context.Context, op *cascade.Op, stage int, bp *cascade.Bump) (string, error) {
-	// No tag prompt for this bump → nothing to claim. Skip the VERSION.md
-	// fetch and tag scan entirely (chart, for instance, has bump-only
-	// stages and no VERSION.md to read).
-	hasPrompt := false
-	for _, tg := range op.Stages[stage].Tags {
-		if tg.Repo == bp.Repo && tg.Branch == bp.Branch {
-			hasPrompt = true
-			break
-		}
-	}
-	if !hasPrompt {
-		return "", nil
-	}
-	tag, err := r.findExistingTagForBump(ctx, bp)
-	if err != nil {
-		return "", err
-	}
-	if tag == "" {
-		return "", nil
-	}
-	for j := range op.Stages[stage].Tags {
-		tg := &op.Stages[stage].Tags[j]
-		if tg.Repo == bp.Repo && tg.Branch == bp.Branch && !tg.Tagged {
-			tg.Version = tag
-			tg.Tagged = true
-			return tag, nil
-		}
-	}
-	// Final stage has no Tags — that's fine, no claim to make.
-	return "", nil
-}
-
-// findExistingTagForBump returns the highest published release tag on bp's
-// branch lineage (matched by minor) where go.mod already pins every dep in
-// bp at its target version. Returns "" when no satisfying tag is found.
-func (r *Reconciler) findExistingTagForBump(ctx context.Context, bp *cascade.Bump) (string, error) {
-	repo, ok := r.cfg.Repos[bp.Repo]
+// bumpRepoView builds a cascade.RepoView scoped to bp's repo. Wraps the
+// reconciler's GH client and version-table cache so cascade can look up
+// the minor, list release tags, fetch go.mod, and check ahead-of without
+// learning about config or VERSION.md directly.
+func (r *Reconciler) bumpRepoView(bp *cascade.Bump) (cascade.RepoView, error) {
+	repoCfg, ok := r.cfg.Repos[bp.Repo]
 	if !ok {
-		return "", fmt.Errorf("repo %q not in config", bp.Repo)
+		return nil, fmt.Errorf("repo %q not in config", bp.Repo)
 	}
-	ghRepo, err := repo.GitHubRepo()
+	ghRepo, err := repoCfg.GitHubRepo()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	tbl, err := r.fetchVersionTable(ctx, bp.Repo)
-	if err != nil {
-		return "", fmt.Errorf("fetch %s VERSION.md: %w", bp.Repo, err)
-	}
-	minor := tbl.LookupMinor(bp.Branch)
-	if minor == "" {
-		return "", nil
-	}
-	tags, err := r.gh.ListReleaseTags(ctx, ghRepo)
-	if err != nil {
-		return "", err
-	}
-	candidates := tags[:0:0]
-	for _, t := range tags {
-		if semver.IsValid(t) && semver.MajorMinor(t) == minor {
-			candidates = append(candidates, t)
-		}
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return semver.Compare(candidates[i], candidates[j]) > 0
-	})
-	for _, tag := range candidates {
-		ok, err := r.tagSatisfiesBump(ctx, ghRepo, tag, bp.Deps)
-		if err != nil {
-			log.Printf("cascade: check %s@%s: %v", ghRepo, tag, err)
-			continue
-		}
-		if !ok {
-			continue
-		}
-		// Reject the tag if the branch has advanced past it: unreleased commits
-		// mean the tag doesn't represent the full current state of the branch and
-		// a new release is required.
-		ahead, err := r.gh.CommitsAheadOf(ctx, ghRepo, tag, bp.Branch)
-		if err != nil {
-			log.Printf("cascade: ahead-of check %s %s...%s: %v", ghRepo, tag, bp.Branch, err)
-			continue
-		}
-		if ahead > 0 {
-			return "", nil
-		}
-		return tag, nil
-	}
-	return "", nil
+	return &reconcileRepoView{r: r, repoKey: bp.Repo, ghRepo: ghRepo}, nil
 }
 
-// tagSatisfiesBump returns true when go.mod at `tag` requires every dep in
-// `deps` at its target version (exact match).
-func (r *Reconciler) tagSatisfiesBump(ctx context.Context, ghRepo, tag string, deps []cascade.DepBump) (bool, error) {
-	gomod, err := r.gh.FetchFile(ctx, ghRepo, tag, "go.mod")
-	if err != nil {
-		return false, err
-	}
-	mf, err := modfile.Parse("go.mod", []byte(gomod), nil)
-	if err != nil {
-		return false, fmt.Errorf("parse go.mod at %s@%s: %w", ghRepo, tag, err)
-	}
-	have := make(map[string]string, len(mf.Require))
-	for _, req := range mf.Require {
-		have[req.Mod.Path] = req.Mod.Version
-	}
-	for _, d := range deps {
-		if have[d.Module] != d.Version {
-			return false, nil
-		}
-	}
-	return true, nil
+// reconcileRepoView adapts the Reconciler's GH + config + version-table
+// cache to cascade.RepoView for one (repoKey, ghRepo) pair.
+type reconcileRepoView struct {
+	r       *Reconciler
+	repoKey string // config key, used by fetchVersionTable's cache
+	ghRepo  string // owner/name
 }
 
-// bumpReady reports whether every Dep in `bp` has a non-empty Version. We
-// only open a Bump's PR once the whole bundle is resolved, since cascades
-// can't go back and add deps to an existing PR without rebasing it.
-func bumpReady(bp *cascade.Bump) bool {
-	if len(bp.Deps) == 0 {
-		return false
+func (v *reconcileRepoView) Minor(ctx context.Context, branch string) (string, error) {
+	tbl, err := v.r.fetchVersionTable(ctx, v.repoKey)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s VERSION.md: %w", v.repoKey, err)
 	}
-	for _, d := range bp.Deps {
-		if d.Version == "" {
-			return false
-		}
-	}
-	return true
+	return tbl.LookupMinor(branch), nil
+}
+
+func (v *reconcileRepoView) ListReleaseTags(ctx context.Context) ([]string, error) {
+	return v.r.gh.ListReleaseTags(ctx, v.ghRepo)
+}
+
+func (v *reconcileRepoView) FetchGoMod(ctx context.Context, ref string) (string, error) {
+	return v.r.gh.FetchFile(ctx, v.ghRepo, ref, "go.mod")
+}
+
+func (v *reconcileRepoView) CommitsAheadOf(ctx context.Context, base, head string) (int, error) {
+	return v.r.gh.CommitsAheadOf(ctx, v.ghRepo, base, head)
 }
 
 func bumpModules(bp *cascade.Bump) []pr.Module {
@@ -548,122 +460,12 @@ func (r *Reconciler) predictNextTag(ctx context.Context, ghRepo, minor string, s
 	}
 	switch strategy {
 	case config.NextTagRC:
-		return predictNextRC(tags, minor), nil
+		return cascade.PredictNextRC(tags, minor), nil
 	case config.NextTagUnRC:
-		return predictUnRC(tags, minor), nil
+		return cascade.PredictUnRC(tags, minor), nil
 	default:
-		return predictNextPatch(tags, minor), nil
+		return cascade.PredictNextPatch(tags, minor), nil
 	}
-}
-
-// predictNextPatch picks the highest patch matching `minor` (e.g. "v0.7")
-// and returns minor + "." + (patch+1). Returns minor + ".0" when no prior
-// release matches — this is the first patch on this minor. Pre-release
-// suffixes on existing tags still bump the implied patch.
-func predictNextPatch(tags []string, minor string) string {
-	highest := -1
-	for _, t := range tags {
-		patch, ok := patchForMinor(t, minor)
-		if !ok {
-			continue
-		}
-		if patch > highest {
-			highest = patch
-		}
-	}
-	if highest < 0 {
-		return minor + ".0"
-	}
-	return fmt.Sprintf("%s.%d", minor, highest+1)
-}
-
-// predictNextRC suggests the next rc tag on `minor`. Picks the highest
-// semver-ordered release on the minor: if it has an rc.N suffix, returns
-// the same major.minor.patch with rc.(N+1); if it's a GA, returns the
-// next patch with rc.1; if no prior release exists, returns minor + ".0-rc.1".
-func predictNextRC(tags []string, minor string) string {
-	var top string
-	for _, t := range tags {
-		if _, ok := patchForMinor(t, minor); !ok {
-			continue
-		}
-		if top == "" || semver.Compare(t, top) > 0 {
-			top = t
-		}
-	}
-	if top == "" {
-		return minor + ".0-rc.1"
-	}
-	base, rc, hasRC := splitRC(top)
-	if hasRC {
-		return fmt.Sprintf("%s-rc.%d", base, rc+1)
-	}
-	patch, _ := patchForMinor(top, minor)
-	return fmt.Sprintf("%s.%d-rc.1", minor, patch+1)
-}
-
-// predictUnRC suggests the GA tag for an in-flight rc on `minor`. Picks the
-// highest semver-ordered release on the minor: if it has an rc.N suffix,
-// returns the suffix-stripped base (v0.9.0-rc.4 → v0.9.0). When the highest
-// existing tag is already GA — or when no prior rc exists on the minor —
-// returns "" because there is nothing to unRC; fillTagPromptHints leaves
-// Expected blank in that case (hints are advisory).
-func predictUnRC(tags []string, minor string) string {
-	var top string
-	for _, t := range tags {
-		if _, ok := patchForMinor(t, minor); !ok {
-			continue
-		}
-		if top == "" || semver.Compare(t, top) > 0 {
-			top = t
-		}
-	}
-	if top == "" {
-		return ""
-	}
-	base, _, hasRC := splitRC(top)
-	if !hasRC {
-		return ""
-	}
-	return base
-}
-
-// patchForMinor returns the patch number of `tag` when it belongs to
-// `minor` (e.g. "v0.7"). Pre-release suffixes are tolerated — the patch is
-// the integer between the second dot and the suffix. Returns (0, false)
-// when the tag is invalid semver, doesn't match the minor, or has no
-// parseable patch.
-func patchForMinor(tag, minor string) (int, bool) {
-	if !semver.IsValid(tag) || semver.MajorMinor(tag) != minor {
-		return 0, false
-	}
-	rest := strings.TrimPrefix(tag, minor+".")
-	if rest == "" {
-		return 0, false
-	}
-	patchStr := rest
-	if i := strings.IndexAny(rest, "-+"); i >= 0 {
-		patchStr = rest[:i]
-	}
-	var patch int
-	if _, err := fmt.Sscanf(patchStr, "%d", &patch); err != nil {
-		return 0, false
-	}
-	return patch, true
-}
-
-// splitRC parses a tag like "v0.7.5-rc.2" into ("v0.7.5", 2, true). For
-// tags without an "-rc.N" suffix, returns (tag, 0, false).
-func splitRC(tag string) (string, int, bool) {
-	i := strings.Index(tag, "-rc.")
-	if i < 0 {
-		return tag, 0, false
-	}
-	var n int
-	if _, err := fmt.Sscanf(tag[i+len("-rc."):], "%d", &n); err != nil {
-		return tag, 0, false
-	}
-	return tag[:i], n, true
 }
 
 // forceUnRCPromotions returns the paired-latest sources that need a bump→tag
@@ -688,7 +490,7 @@ func (r *Reconciler) forceUnRCPromotions(sources []cascade.Source) map[string]bo
 		if repo.NextTagStrategy != config.NextTagUnRC {
 			continue
 		}
-		if _, _, hasRC := splitRC(src.Version); !hasRC {
+		if _, _, hasRC := cascade.SplitRC(src.Version); !hasRC {
 			continue
 		}
 		out[src.Name] = true
