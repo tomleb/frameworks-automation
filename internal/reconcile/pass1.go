@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/mod/semver"
 
+	"github.com/rancher/release-automation/internal/cascade"
 	"github.com/rancher/release-automation/internal/config"
 	"github.com/rancher/release-automation/internal/tracker"
 )
@@ -57,34 +58,12 @@ func (r *Reconciler) pass1Dispatch(ctx context.Context, ev DispatchEvent) error 
 	return r.runBump(ctx, dep, ev.Tag, leafBranch)
 }
 
-// deriveLeafBranchForDispatch picks the leaf branch this auto-bump targets:
-//
-//	independent → "main" only. Older release/* branches require a manual
-//	              `Bump <dep>` workflow run (the cron path doesn't infer
-//	              them since there's no version-pair to consult).
-//	paired      → dep.VERSION.md row whose Minor == version's minor gives
-//	              Pair (= leaf.minor); leaf.VERSION.md row whose Minor ==
-//	              that pair gives leaf.branch.
-//
-// Returns "" (no error) when the chain exists but the leaf hasn't cut the
-// matching branch yet.
+// deriveLeafBranchForDispatch is a thin reconciler-side wrapper that
+// fetches the leaf and (for paired deps) dep VERSION.md tables, then
+// hands off to cascade.LeafBranchForDepVersion. The version-table cache
+// on the Reconciler keeps repeat fetches free across pass1Dispatch and
+// checkUpstream.
 func (r *Reconciler) deriveLeafBranchForDispatch(ctx context.Context, dep, version string) (string, error) {
-	if r.cfg.Repos[dep].Kind == config.KindIndependent {
-		return "main", nil
-	}
-	depTable, err := r.fetchVersionTable(ctx, dep)
-	if err != nil {
-		return "", fmt.Errorf("fetch %s VERSION.md: %w", dep, err)
-	}
-	minor := semver.MajorMinor(version)
-	if minor == "" {
-		return "", fmt.Errorf("invalid semver %q", version)
-	}
-	pair := depTable.LookupPair(minor)
-	if pair == "" {
-		return "", fmt.Errorf("dep %s minor %s not in VERSION.md", dep, minor)
-	}
-
 	leaves := r.cfg.LeafRepos()
 	if len(leaves) != 1 {
 		return "", fmt.Errorf("expected exactly one leaf repo, found %d: %v", len(leaves), leaves)
@@ -93,30 +72,49 @@ func (r *Reconciler) deriveLeafBranchForDispatch(ctx context.Context, dep, versi
 	if err != nil {
 		return "", fmt.Errorf("fetch %s VERSION.md: %w", leaves[0], err)
 	}
-	return leafTable.BranchForMinor(pair), nil
+	var depTable *config.VersionTable
+	if r.cfg.Repos[dep].Kind == config.KindPaired {
+		depTable, err = r.fetchVersionTable(ctx, dep)
+		if err != nil {
+			return "", fmt.Errorf("fetch %s VERSION.md: %w", dep, err)
+		}
+	}
+	return cascade.LeafBranchForDepVersion(r.cfg, dep, version, leafTable, depTable)
 }
 
+// fetchVersionTable returns the parsed VERSION.md table for repoKey,
+// caching the result on the Reconciler for the lifetime of this
+// invocation. Multiple callers within one tick (pass1Dispatch +
+// checkUpstream + runBump + RunCascade) share the same fetch, avoiding
+// O(N) duplicate GitHub round-trips per cron sweep.
 func (r *Reconciler) fetchVersionTable(ctx context.Context, repoKey string) (*config.VersionTable, error) {
+	if tbl, ok := r.versionTables[repoKey]; ok {
+		return tbl, nil
+	}
 	repo := r.cfg.Repos[repoKey]
+	var tbl *config.VersionTable
 	if repo.VersionMD != "" {
-		tbl, err := config.ParseVersionTable(repo.VersionMD)
+		t, err := config.ParseVersionTable(repo.VersionMD)
 		if err != nil {
 			return nil, fmt.Errorf("parse inline version-md for %s: %w", repoKey, err)
 		}
-		return tbl, nil
+		tbl = t
+	} else {
+		ghRepo, err := repo.GitHubRepo()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", repoKey, err)
+		}
+		raw, err := r.gh.FetchFile(ctx, ghRepo, "", "VERSION.md")
+		if err != nil {
+			return nil, fmt.Errorf("fetch VERSION.md from %s: %w", ghRepo, err)
+		}
+		t, err := config.ParseVersionTable(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse VERSION.md from %s: %w", ghRepo, err)
+		}
+		tbl = t
 	}
-	ghRepo, err := repo.GitHubRepo()
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", repoKey, err)
-	}
-	raw, err := r.gh.FetchFile(ctx, ghRepo, "", "VERSION.md")
-	if err != nil {
-		return nil, fmt.Errorf("fetch VERSION.md from %s: %w", ghRepo, err)
-	}
-	tbl, err := config.ParseVersionTable(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse VERSION.md from %s: %w", ghRepo, err)
-	}
+	r.versionTables[repoKey] = tbl
 	return tbl, nil
 }
 

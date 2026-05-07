@@ -128,6 +128,47 @@ func resolveLatestForBranch(ctx context.Context, cfg *config.Config, factory Rep
 	return best, nil
 }
 
+// LeafBranchForDepVersion returns the leaf branch this `dep`@`version`
+// auto-bump targets. Inverse of branchForRepo: where branchForRepo asks
+// "given the leaf's minor, which branch on this paired dep matches?",
+// LeafBranchForDepVersion asks "given a dep's version, which leaf
+// branch does it flow into?".
+//
+//	independent → "main" (older release/* lines require a manual
+//	              `Bump <dep>` workflow run; the auto path doesn't
+//	              infer them since there's no version-pair to consult).
+//	paired      → dep.VERSION.md row whose Minor == version's minor
+//	              gives Pair (= leaf.minor); leaf.VERSION.md row whose
+//	              Minor == that pair gives leaf.branch.
+//
+// `depTable` may be nil for independents (it's not consulted). Returns
+// "" with nil error when the chain exists but the leaf hasn't cut the
+// matching branch yet.
+func LeafBranchForDepVersion(cfg *config.Config, dep, version string, leafTable, depTable *config.VersionTable) (string, error) {
+	depCfg, ok := cfg.Repos[dep]
+	if !ok {
+		return "", fmt.Errorf("dep %q not in config", dep)
+	}
+	if depCfg.Kind == config.KindIndependent {
+		return "main", nil
+	}
+	if depTable == nil {
+		return "", fmt.Errorf("dep %q: depTable required for paired kind", dep)
+	}
+	if leafTable == nil {
+		return "", fmt.Errorf("dep %q: leafTable required for paired kind", dep)
+	}
+	minor := semver.MajorMinor(version)
+	if minor == "" {
+		return "", fmt.Errorf("invalid semver %q", version)
+	}
+	pair := depTable.LookupPair(minor)
+	if pair == "" {
+		return "", fmt.Errorf("dep %s minor %s not in VERSION.md", dep, minor)
+	}
+	return leafTable.BranchForMinor(pair), nil
+}
+
 // branchForRepo returns the branch of `repoName` that corresponds to
 // `leafMinor`. Handles independent (always "main"), branch-template
 // paired (template substitution) and VERSION.md paired (table lookup).

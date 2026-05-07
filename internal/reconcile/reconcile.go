@@ -63,6 +63,14 @@ type Reconciler struct {
 	settings   Settings
 	gh         gitHubClient
 	bumper     Bumper
+
+	// versionTables caches VERSION.md tables for the lifetime of this
+	// Reconciler instance. main.go creates a fresh Reconciler per
+	// invocation (cron tick / dispatch / cascade run), so cache lifetime
+	// is one tick — there's no stale-data risk. The reconciler runs
+	// single-threaded (workflow concurrency group + no goroutine fanning
+	// inside), so no mutex is needed.
+	versionTables map[string]*config.VersionTable
 }
 
 func New(configName string, cfg *config.Config, s Settings) (*Reconciler, error) {
@@ -86,11 +94,12 @@ func New(configName string, cfg *config.Config, s Settings) (*Reconciler, error)
 // tests that inject in-memory fakes; prod goes through New.
 func newWithDeps(configName string, cfg *config.Config, s Settings, gh gitHubClient, bumper Bumper) *Reconciler {
 	return &Reconciler{
-		configName: configName,
-		cfg:        cfg,
-		settings:   s,
-		gh:         gh,
-		bumper:     bumper,
+		configName:    configName,
+		cfg:           cfg,
+		settings:      s,
+		gh:            gh,
+		bumper:        bumper,
+		versionTables: map[string]*config.VersionTable{},
 	}
 }
 
