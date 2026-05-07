@@ -6,51 +6,6 @@ import (
 	"time"
 )
 
-func TestRoundTripState(t *testing.T) {
-	body := "## Trigger\nsteve v0.7.5 released\n"
-	in := Persistent{
-		Targets: []Target{
-			{Repo: "rancher", Branch: "main", PR: 1234, State: "open"},
-			{Repo: "rancher", Branch: "release/v2.13", PR: 1235, State: "open"},
-		},
-	}
-	updated, err := EmbedState(body, in)
-	if err != nil {
-		t.Fatalf("embed: %v", err)
-	}
-	got, err := ExtractState(updated)
-	if err != nil {
-		t.Fatalf("extract: %v", err)
-	}
-	if len(got.Targets) != 2 || got.Targets[0].PR != 1234 || got.Targets[1].Branch != "release/v2.13" {
-		t.Errorf("targets: got %+v", got.Targets)
-	}
-}
-
-func TestEmbedReplacesExisting(t *testing.T) {
-	body := "header\n"
-	one, two := 111, 222
-	first, _ := EmbedState(body, Persistent{SupersededBy: &one})
-	second, err := EmbedState(first, Persistent{SupersededBy: &two})
-	if err != nil {
-		t.Fatalf("embed second: %v", err)
-	}
-	got, _ := ExtractState(second)
-	if got.SupersededBy == nil || *got.SupersededBy != 222 {
-		t.Errorf("superseded_by after replace: got %v want 222", got.SupersededBy)
-	}
-}
-
-func TestExtractMissingBlock(t *testing.T) {
-	got, err := ExtractState("just a body\n")
-	if err != nil {
-		t.Fatalf("expected no error for missing block, got: %v", err)
-	}
-	if len(got.Targets) != 0 || got.SupersededBy != nil {
-		t.Errorf("expected zero state, got %+v", got)
-	}
-}
-
 func TestRender_BodyContainsTargetsAndState(t *testing.T) {
 	op := Op{
 		Dep:     "steve",
@@ -79,7 +34,7 @@ func TestRender_BodyContainsTargetsAndState(t *testing.T) {
 	if !strings.Contains(body, "Last reconciled: 2026-04-21T10:00:00Z") {
 		t.Errorf("body missing reconciled timestamp: %s", body)
 	}
-	st, err := ExtractState(body)
+	st, err := Envelope.Extract(body)
 	if err != nil {
 		t.Fatalf("extract from rendered: %v", err)
 	}

@@ -152,7 +152,7 @@ func TestTryClaimCascadeTag_ScopedByConfig(t *testing.T) {
 	// Inspect both issues — the test-config one should now record the tag,
 	// the other-config one must be unchanged.
 	for _, issue := range gh.snapshotIssues() {
-		st, err := cascade.ExtractState(issue.Body)
+		st, err := cascade.Envelope.Extract(issue.Body)
 		if err != nil {
 			t.Fatalf("extract %s: %v", issue.Title, err)
 		}

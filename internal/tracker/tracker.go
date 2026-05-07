@@ -10,12 +10,12 @@
 package tracker
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	ghclient "github.com/rancher/release-automation/internal/github"
+	"github.com/rancher/release-automation/internal/issuestate"
 )
 
 const (
@@ -23,10 +23,15 @@ const (
 	LabelConfigFmt = "config:%s"     // e.g. config:rancher-chart-webhook
 	LabelDepFmt    = "dep:%s"        // e.g. dep:steve
 	LabelLeafFmt   = "leaf:%s:%s"    // e.g. leaf:rancher:main, leaf:rancher:release/v2.13
-
-	stateOpen  = "<!-- bump-op-state v1"
-	stateClose = "-->"
 )
+
+// Envelope is the issue-state envelope for bump-op trackers — the marker
+// pair that wraps the YAML metadata block in the issue body. Use
+// Envelope.Extract / Envelope.Embed to round-trip Persistent.
+var Envelope = issuestate.Marker[Persistent]{
+	Open:  "<!-- bump-op-state v1",
+	Close: "-->",
+}
 
 // titlePrefixFmt matches Title(): "[bump:{config}] {dep} {version} → {leafRepo} {leafBranch}".
 // Stable — ParseVersionFromTitle relies on the prefix and the " → " separator.
@@ -158,7 +163,7 @@ func Render(op Op, now time.Time) (string, error) {
 
 	fmt.Fprintf(&b, "\n## Status\nLast reconciled: %s\n\n", now.UTC().Format(time.RFC3339))
 
-	body, err := EmbedState(b.String(), Persistent{Targets: op.Targets})
+	body, err := Envelope.Embed(b.String(), Persistent{Targets: op.Targets})
 	if err != nil {
 		return "", err
 	}
@@ -192,7 +197,7 @@ func renderRef(t Target) string {
 	if t.State == "ci-failing" && t.PRURL != "" {
 		state = fmt.Sprintf("[%s](%s/checks)", state, t.PRURL)
 	}
-	if t.PRURL != "" && !isTerminalState(t.State) {
+	if t.PRURL != "" && !ghclient.IsTerminalPRState(t.State) {
 		state = fmt.Sprintf("%s · [checks](%s/checks)", state, t.PRURL)
 	}
 	if t.PRURL == "" {
@@ -201,56 +206,3 @@ func renderRef(t Target) string {
 	return fmt.Sprintf("[#%d](%s) (%s)", t.PR, t.PRURL, state)
 }
 
-// isTerminalState mirrors reconcile.isTerminal — duplicated here to avoid
-// importing the reconcile package from tracker (would create a cycle).
-func isTerminalState(s string) bool {
-	return s == "merged" || s == "closed"
-}
-
-// ExtractState pulls the metadata block out of an issue body. Returns
-// zero-value Persistent (no error) if the block is absent — useful for
-// trackers created out-of-band that the reconciler is adopting.
-func ExtractState(body string) (Persistent, error) {
-	start := strings.Index(body, stateOpen)
-	if start < 0 {
-		return Persistent{}, nil
-	}
-	rest := body[start+len(stateOpen):]
-	end := strings.Index(rest, stateClose)
-	if end < 0 {
-		return Persistent{}, fmt.Errorf("metadata block missing closing %q", stateClose)
-	}
-	var s Persistent
-	if err := yaml.Unmarshal([]byte(rest[:end]), &s); err != nil {
-		return Persistent{}, fmt.Errorf("parse metadata block: %w", err)
-	}
-	return s, nil
-}
-
-// EmbedState replaces (or appends) the metadata block in `body` with `s`.
-// Use this when updating an existing issue body to keep the human-readable
-// part intact.
-func EmbedState(body string, s Persistent) (string, error) {
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(s); err != nil {
-		return "", fmt.Errorf("encode metadata: %w", err)
-	}
-	enc.Close()
-	block := stateOpen + "\n" + buf.String() + stateClose
-
-	start := strings.Index(body, stateOpen)
-	if start < 0 {
-		if !strings.HasSuffix(body, "\n") {
-			body += "\n"
-		}
-		return body + "\n" + block + "\n", nil
-	}
-	end := strings.Index(body[start:], stateClose)
-	if end < 0 {
-		return "", fmt.Errorf("metadata block missing closing %q", stateClose)
-	}
-	end += start + len(stateClose)
-	return body[:start] + block + body[end:], nil
-}

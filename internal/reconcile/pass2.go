@@ -38,7 +38,7 @@ func (r *Reconciler) pollTracker(ctx context.Context, issue *ghclient.Issue) err
 	if version == "" {
 		return fmt.Errorf("title %q has no parseable version for dep %q", issue.Title, dep)
 	}
-	st, err := tracker.ExtractState(issue.Body)
+	st, err := tracker.Envelope.Extract(issue.Body)
 	if err != nil {
 		return fmt.Errorf("extract state: %w", err)
 	}
@@ -46,7 +46,7 @@ func (r *Reconciler) pollTracker(ctx context.Context, issue *ghclient.Issue) err
 
 	mutated := false
 	for i, t := range op.Targets {
-		if t.PR == 0 || isTerminal(t.State) {
+		if t.PR == 0 || ghclient.IsTerminalPRState(t.State) {
 			continue
 		}
 		downstream, ok := r.cfg.Repos[t.Repo]
@@ -114,12 +114,6 @@ func derivePRState(pr *ghclient.PR) string {
 	return "open"
 }
 
-// isTerminal reports whether a target is done — pass 2 skips it on subsequent
-// polls and the tracker can close once every target is terminal.
-func isTerminal(state string) bool {
-	return state == "merged" || state == "closed"
-}
-
 // allTerminal returns true only when every target has a PR and is terminal.
 // Targets without a PR (PR == 0) are pending bump opens — never terminal.
 func allTerminal(targets []tracker.Target) bool {
@@ -127,7 +121,7 @@ func allTerminal(targets []tracker.Target) bool {
 		return false
 	}
 	for _, t := range targets {
-		if t.PR == 0 || !isTerminal(t.State) {
+		if t.PR == 0 || !ghclient.IsTerminalPRState(t.State) {
 			return false
 		}
 	}

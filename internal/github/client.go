@@ -221,6 +221,13 @@ type PR struct {
 	URL     string // HTML URL
 }
 
+// IsTerminalPRState reports whether a derived PR-state string is final —
+// "merged" or "closed". Used by tracker, cascade, and reconcile passes to
+// skip further polling and to decide when a tracker can be closed.
+func IsTerminalPRState(state string) bool {
+	return state == "merged" || state == "closed"
+}
+
 // GetPR fetches a single PR's current state. Used by pass 2 to poll
 // open trackers' linked PRs without paging the full list.
 func (c *Client) GetPR(ctx context.Context, repo string, number int) (*PR, error) {

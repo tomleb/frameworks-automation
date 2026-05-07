@@ -49,7 +49,7 @@ func FindOrCreate(ctx context.Context, gh API, automationRepo, config string, op
 		if ParseVersionFromTitle(existing.Title, op.Dep) != op.Version {
 			continue
 		}
-		st, err := ExtractState(existing.Body)
+		st, err := Envelope.Extract(existing.Body)
 		if err != nil {
 			return nil, fmt.Errorf("read state from tracker #%d: %w", existing.Number, err)
 		}
@@ -103,7 +103,7 @@ func Supersede(ctx context.Context, gh API, automationRepo, config string, dep, 
 		if semver.Compare(ver, newVersion) >= 0 {
 			continue // not older
 		}
-		st, err := ExtractState(issue.Body)
+		st, err := Envelope.Extract(issue.Body)
 		if err != nil {
 			return fmt.Errorf("read state from tracker #%d: %w", issue.Number, err)
 		}

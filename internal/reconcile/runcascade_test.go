@@ -73,7 +73,7 @@ func runFixture(t *testing.T, dir string) {
 	}
 	tracker := issues[0]
 
-	persisted, err := cascade.ExtractState(tracker.Body)
+	persisted, err := cascade.Envelope.Extract(tracker.Body)
 	if err != nil {
 		t.Fatalf("extract cascade state: %v", err)
 	}

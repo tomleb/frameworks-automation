@@ -165,7 +165,7 @@ func (r *Reconciler) RunCascade(ctx context.Context, leafBranch string, independ
 // closes the issue itself.
 func (r *Reconciler) supersedeCascade(ctx context.Context, old *cascade.Issue) error {
 	log.Printf("cascade: superseding cascade #%d (explicit-source set changed)", old.Number)
-	st, err := cascade.ExtractState(old.Body)
+	st, err := cascade.Envelope.Extract(old.Body)
 	if err != nil {
 		log.Printf("cascade: supersede #%d: extract state: %v", old.Number, err)
 	} else {

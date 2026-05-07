@@ -20,25 +20,29 @@
 package cascade
 
 import (
-	"bytes"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/rancher/release-automation/internal/config"
+	ghclient "github.com/rancher/release-automation/internal/github"
+	"github.com/rancher/release-automation/internal/issuestate"
 )
 
 const (
 	LabelOp        = "cascade-op"
 	LabelConfigFmt = "config:%s"
 	LabelLeafFmt   = "leaf:%s:%s"
-
-	stateOpen  = "<!-- cascade-op-state v1"
-	stateClose = "-->"
 )
+
+// Envelope is the issue-state envelope for cascade trackers — the marker
+// pair that wraps the YAML metadata block in the issue body. Use
+// Envelope.Extract / Envelope.Embed to round-trip Persistent.
+var Envelope = issuestate.Marker[Persistent]{
+	Open:  "<!-- cascade-op-state v1",
+	Close: "-->",
+}
 
 // Source identifies one (dep, version) feeding the cascade.
 //
@@ -268,7 +272,7 @@ func Render(op Op, now time.Time) (string, error) {
 	fmt.Fprintf(&b, "## Status\nCurrent stage: %d/%d\nLast reconciled: %s\n\n",
 		op.CurrentStage+1, len(op.Stages), now.UTC().Format(time.RFC3339))
 
-	body, err := EmbedState(b.String(), Persistent{
+	body, err := Envelope.Embed(b.String(), Persistent{
 		TriggeredBy:  op.TriggeredBy,
 		Sources:      op.Sources,
 		Stages:       op.Stages,
@@ -399,7 +403,7 @@ func renderBumpRef(b Bump) string {
 	if b.State == "ci-failing" && b.PRURL != "" {
 		state = fmt.Sprintf("[%s](%s/checks)", state, b.PRURL)
 	}
-	if b.PRURL != "" && !isTerminalState(b.State) {
+	if b.PRURL != "" && !ghclient.IsTerminalPRState(b.State) {
 		state = fmt.Sprintf("%s · [checks](%s/checks)", state, b.PRURL)
 	}
 	if b.PRURL == "" {
@@ -408,53 +412,3 @@ func renderBumpRef(b Bump) string {
 	return fmt.Sprintf("[#%d](%s) (%s)", b.PR, b.PRURL, state)
 }
 
-// isTerminalState mirrors reconcile.isTerminal — duplicated here to avoid
-// importing the reconcile package from cascade (would create a cycle).
-func isTerminalState(s string) bool {
-	return s == "merged" || s == "closed"
-}
-
-// ExtractState pulls the metadata block out of a cascade issue body. Returns
-// zero-value Persistent (no error) if absent.
-func ExtractState(body string) (Persistent, error) {
-	start := strings.Index(body, stateOpen)
-	if start < 0 {
-		return Persistent{}, nil
-	}
-	rest := body[start+len(stateOpen):]
-	end := strings.Index(rest, stateClose)
-	if end < 0 {
-		return Persistent{}, fmt.Errorf("metadata block missing closing %q", stateClose)
-	}
-	var s Persistent
-	if err := yaml.Unmarshal([]byte(rest[:end]), &s); err != nil {
-		return Persistent{}, fmt.Errorf("parse metadata block: %w", err)
-	}
-	return s, nil
-}
-
-// EmbedState replaces (or appends) the metadata block in `body` with `s`.
-func EmbedState(body string, s Persistent) (string, error) {
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(s); err != nil {
-		return "", fmt.Errorf("encode metadata: %w", err)
-	}
-	enc.Close()
-	block := stateOpen + "\n" + buf.String() + stateClose
-
-	start := strings.Index(body, stateOpen)
-	if start < 0 {
-		if !strings.HasSuffix(body, "\n") {
-			body += "\n"
-		}
-		return body + "\n" + block + "\n", nil
-	}
-	end := strings.Index(body[start:], stateClose)
-	if end < 0 {
-		return "", fmt.Errorf("metadata block missing closing %q", stateClose)
-	}
-	end += start + len(stateClose)
-	return body[:start] + block + body[end:], nil
-}

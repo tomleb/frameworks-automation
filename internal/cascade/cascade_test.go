@@ -6,67 +6,6 @@ import (
 	"time"
 )
 
-func TestRoundTripState(t *testing.T) {
-	body := "## Cascade\nrancher main\n"
-	in := Persistent{
-		Sources: []Source{
-			{Name: "wrangler", Version: "v0.5.1", Explicit: true},
-			{Name: "steve", Version: "v0.7.5"},
-		},
-		CurrentStage: 1,
-		Stages: []Stage{
-			{Layer: 1, Bumps: []Bump{{Repo: "steve", Branch: "main", PR: 42, State: "merged",
-				Deps: []DepBump{{Dep: "wrangler", Module: "github.com/x/wrangler", Version: "v0.5.1"}}}},
-				Tags: []TagPrompt{{Repo: "steve", Branch: "main", Version: "v0.7.6", Tagged: true}}},
-			{Layer: 2, Bumps: []Bump{{Repo: "rancher", Branch: "main", PR: 99, State: "open",
-				Deps: []DepBump{{Dep: "steve", Module: "github.com/x/steve", Version: "v0.7.6"}}}}},
-		},
-	}
-	updated, err := EmbedState(body, in)
-	if err != nil {
-		t.Fatalf("embed: %v", err)
-	}
-	got, err := ExtractState(updated)
-	if err != nil {
-		t.Fatalf("extract: %v", err)
-	}
-	if got.CurrentStage != 1 {
-		t.Errorf("current_stage: got %d want 1", got.CurrentStage)
-	}
-	if len(got.Sources) != 2 || got.Sources[0].Name != "wrangler" || !got.Sources[0].Explicit {
-		t.Errorf("sources: got %+v", got.Sources)
-	}
-	if len(got.Stages) != 2 || got.Stages[0].Bumps[0].PR != 42 || got.Stages[1].Bumps[0].Deps[0].Dep != "steve" {
-		t.Errorf("stages: got %+v", got.Stages)
-	}
-	if !got.Stages[0].Tags[0].Tagged || got.Stages[0].Tags[0].Version != "v0.7.6" {
-		t.Errorf("tag prompt: got %+v", got.Stages[0].Tags[0])
-	}
-}
-
-func TestEmbedReplacesExisting(t *testing.T) {
-	body := "header\n"
-	first, _ := EmbedState(body, Persistent{TriggeredBy: "alice"})
-	second, err := EmbedState(first, Persistent{TriggeredBy: "bob"})
-	if err != nil {
-		t.Fatalf("embed second: %v", err)
-	}
-	got, _ := ExtractState(second)
-	if got.TriggeredBy != "bob" {
-		t.Errorf("triggered_by after replace: got %q want bob", got.TriggeredBy)
-	}
-}
-
-func TestExtractMissingBlock(t *testing.T) {
-	got, err := ExtractState("just a body\n")
-	if err != nil {
-		t.Fatalf("expected no error for missing block, got: %v", err)
-	}
-	if len(got.Stages) != 0 || got.TriggeredBy != "" {
-		t.Errorf("expected zero state, got %+v", got)
-	}
-}
-
 func TestRender_BodyContainsStagesAndState(t *testing.T) {
 	op := Op{
 		LeafRepo:     "rancher",
@@ -112,7 +51,7 @@ func TestRender_BodyContainsStagesAndState(t *testing.T) {
 	if !strings.Contains(body, "Last reconciled: 2026-04-21T10:00:00Z") {
 		t.Errorf("body missing reconciled timestamp: %s", body)
 	}
-	st, err := ExtractState(body)
+	st, err := Envelope.Extract(body)
 	if err != nil {
 		t.Fatalf("extract from rendered: %v", err)
 	}
@@ -222,7 +161,7 @@ func TestRender_MermaidDiagram(t *testing.T) {
 	}
 
 	// Existing assertions still pass: state block round-trips.
-	st, err := ExtractState(body)
+	st, err := Envelope.Extract(body)
 	if err != nil {
 		t.Fatalf("extract state: %v", err)
 	}

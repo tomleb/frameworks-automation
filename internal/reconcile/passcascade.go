@@ -41,7 +41,7 @@ func (r *Reconciler) advanceCascade(ctx context.Context, issue *ghclient.Issue) 
 	if leafRepo == "" || leafBranch == "" {
 		return fmt.Errorf("no leaf:* label")
 	}
-	st, err := cascade.ExtractState(issue.Body)
+	st, err := cascade.Envelope.Extract(issue.Body)
 	if err != nil {
 		return fmt.Errorf("extract state: %w", err)
 	}
@@ -104,7 +104,7 @@ func (r *Reconciler) pollCascadeBumps(ctx context.Context, op *cascade.Op) (bool
 	stage := &op.Stages[op.CurrentStage]
 	for i := range stage.Bumps {
 		bp := &stage.Bumps[i]
-		if bp.PR == 0 || isTerminal(bp.State) {
+		if bp.PR == 0 || ghclient.IsTerminalPRState(bp.State) {
 			continue
 		}
 		downstream, ok := r.cfg.Repos[bp.Repo]
@@ -256,7 +256,7 @@ func (r *Reconciler) tryClaimCascadeTag(ctx context.Context, dep, version string
 		return false, err
 	}
 	for _, issue := range cascades {
-		st, err := cascade.ExtractState(issue.Body)
+		st, err := cascade.Envelope.Extract(issue.Body)
 		if err != nil {
 			log.Printf("passCascade: claim: cascade #%d unreadable state: %v", issue.Number, err)
 			continue

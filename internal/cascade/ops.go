@@ -57,7 +57,7 @@ func FindOrCreate(
 		return nil, fmt.Errorf("find cascade for %s %s: %w", op.LeafRepo, op.LeafBranch, err)
 	}
 	for _, existing := range candidates {
-		st, err := ExtractState(existing.Body)
+		st, err := Envelope.Extract(existing.Body)
 		if err != nil {
 			return nil, fmt.Errorf("read state from cascade #%d: %w", existing.Number, err)
 		}
